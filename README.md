@@ -2,7 +2,9 @@
 
 通过 Telegram「聊天自动化」连接账号，把双向私聊保存到**你与 Bot 私聊中的联系人话题**，并按需开启 AI 自动回复。无需归档群、Webhook、域名、公网端口或 Cloudflare。仅配置的 OWNER_ID 可以接入和管理。
 
-运行时只有 Node.js 24 与内置 SQLite，零 npm 运行依赖。镜像支持 Linux amd64 / arm64，数据库保存在 `/data` 持久化卷中。
+当前版本已全部改为 **Go + 静态链接 SQLite**。最终镜像使用 `scratch`，只有单个可执行文件和 HTTPS CA 证书，没有 Node.js、npm、Shell 或发行版运行环境。支持 Linux amd64 / arm64；状态集中保存在 `/data/bot.sqlite`。
+
+HTTP、JSON、长轮询、调度均使用 Go 标准库，唯一第三方依赖是编译进二进制的 SQLite 驱动。默认 `GOMEMLIMIT=32MiB` 是 Go 管理内存的软目标，**不是容器总内存上限**，不涵盖 SQLite C 内存、网络缓冲等。模型并发最多 4 个，不常驻每位联系人的数据库连接。
 
 ## Linux Docker 部署
 
@@ -114,25 +116,44 @@ docker compose cp bot:/data ./backup-data
 docker compose start
 ```
 
-数据库含私人聊天，未自动加密，历史记录不自动清理，需保护备份并留意磁盘容量。每个账号/联系人使用独立的小型 SQLite 文件，文件数随联系人增加。仅支持单实例、本地磁盘卷，不支持多副本或 NFS 共享卷。新 Bot 或 OWNER_ID 使用新卷。
+数据库含私人聊天，未自动加密，历史记录不自动清理，需保护备份并留意磁盘容量。Go 版使用单个 SQLite 数据库和有界连接，上下文按需读取。仅支持单实例、本地磁盘卷，不支持多副本或 NFS 共享卷。新 Bot 或 OWNER_ID 使用新卷。
 
 Workers Durable Objects 数据不自动迁移；新服务从收到的新更新开始归档，旧 Telegram 副本仍保留。
+
+## 从 Node/TypeScript 版升级
+
+先备份数据并停用旧容器，再拉取新镜像，继续挂载同一个数据卷：
+
+```bash
+docker compose stop
+docker compose cp bot:/data ./backup-before-go
+docker compose pull
+docker compose up -d --force-recreate
+```
+
+首次启动会在单个事务中导入旧版 `account-*.sqlite`、`chat-*.sqlite` 的提示词、暂停、额度、话题、消息版本、归档任务和长轮询 offset，保留联系人话题中的归档任务 ID。事务失败不会留下部分导入结果，下次可重试。
+
+原文件保持不变，Go 版只更新 `bot.sqlite`。中断时已进入发送阶段的任务标记为待核对；旧版尚在生成或等待重试的 AI 结果作废，等待新文字。
+
+不要同时运行两个版本。升级后旧数据库已过期，回退必须恢复升级前的完整卷备份，并核对升级后已经发送的消息，不能直接用旧镜像继续读取旧文件。旧镜像固定标签为 `sha-d1f865f`，仅供必要时回退。
 
 ## 开发和 GitHub Packages 发布
 
 ```bash
-npm ci
-npm run typecheck
-npm test
-npm run build
-node --env-file=.env dist/main.js
+go mod download
+go vet ./...
+go test -race ./...
+go build -trimpath -tags "netgo osusergo sqlite_omit_load_extension" -ldflags "-s -w" -o bot .
+# 将 BOT_TOKEN、OWNER_ID 等导出为环境变量后运行
+./bot
+# Docker 内自动使用 musl 静态链接
 docker build -t tg-saventalk-bot .
 ```
 
-需要 Node.js 24.4+，推荐最新 Node 24 LTS。镜像不包含 npm 依赖、编译器和测试工具，使用非 root 用户，不映射端口。
+开发需要 Go 1.26.5+ 和 C 编译器。Linux 镜像使用 Alpine/musl 静态编译，移除调试符号，不使用 UPX；最终运行镜像不需要构建工具。以 UID/GID 1000 非 root 运行，不映射端口；支持 `/bot healthcheck` 和离线 `/bot selftest`，无需 Shell。
 
-GitHub Actions 在 push main、`v*` 标签或手动触发时执行检查，构建 amd64/arm64 镜像并上传 GHCR。使用仓库 `GITHUB_TOKEN` 的 `packages:write` 权限，无需个人发布密钥。PR 只验证不上传。参见 [GitHub 发布镜像](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images)、[Node SQLite](https://nodejs.org/api/sqlite.html)。
+GitHub Actions 在 push main、`v*` 标签或手动触发时，在原生 amd64、arm64 Linux runner 分别执行 `go vet`、竞态检测、静态镜像构建和非 root 容器测试。两种架构均成功后才发布合并标签。使用仓库 `GITHUB_TOKEN` 的 `packages:write` 权限，无需个人发布密钥。PR 只验证不上传。参见 [GitHub 发布镜像](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images)、[Go SQLite 静态链接](https://github.com/mattn/go-sqlite3#cross-compile)。
 
 自动测试使用真实 SQLite 和模拟 Telegram/AI 接口，覆盖授权、双向归档、编辑删除乱序、额度暂停、模型延迟、429、结果不确定及重启恢复。真实部署后用两个账号验收：发送/编辑/删除文本与媒体，确认副本；设置额度 2 验证停止；主人手动回复验证接管；重启验证映射和额度保留。
 
-业务逻辑迁移自 tg-saventalk Workers 版，采用独立 Node SQLite 调度器，遵循仓库 GPL-3.0 许可证。
+业务逻辑源自 tg-saventalk，目前为独立 Go 实现，遵循仓库 GPL-3.0 许可证。旧 TypeScript 源码只保留在 Git 历史中。

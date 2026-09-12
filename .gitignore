@@ -4,3 +4,7 @@ data/
 .env
 *.log
 coverage/
+
+/bot
+/bot.exe
+/coverage.out

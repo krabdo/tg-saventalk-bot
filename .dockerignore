@@ -1,6 +1,6 @@
-node_modules
-dist
-.git
-.env
-data
-*.log
+*
+!*.go
+!go.mod
+!go.sum
+!Dockerfile
+!LICENSE

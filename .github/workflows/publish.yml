@@ -1,4 +1,4 @@
-name: Test and publish Linux image
+name: Test and publish Go Linux image
 on:
   push:
     branches: [main]
@@ -10,16 +10,22 @@ permissions:
   packages: write
 jobs:
   image:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-go@v5
         with:
-          node-version: '24'
-          cache: npm
-      - run: npm ci
-      - run: npm run typecheck && npm test && npm run build
-      - uses: docker/setup-qemu-action@v3
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./... && go test -race ./... -count=1
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         if: github.event_name != 'pull_request'
@@ -27,36 +33,58 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha
-            type=ref,event=tag
       - uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Smoke test published container
-        if: github.event_name != 'pull_request'
-        env:
-          IMAGE: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          load: true
+          tags: secretary:test
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+      - name: Test static container and measure size
         run: |
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY}:sha-${GITHUB_SHA:0:7}"
-          docker run --rm --entrypoint node "$IMAGE" --input-type=module -e '
-            import { Runtime } from "./dist/runtime.js";
-            import "./dist/main.js";
-            const r = new Runtime("/data", {BOT_TOKEN:"1:test",OWNER_ID:"100",AI_BASE_URL:"",AI_MODEL:""});
-            const a = r.env.ACCOUNTS.getByName("100");
-            if (!a.policy().paused || process.getuid() === 0) throw new Error("Invalid container defaults");
-            await a.enqueue({update_id:1});
-            await r.close();
-            console.log("Non-root Linux container and persistent SQLite initialized successfully");
-          '
+          docker run --rm secretary:test selftest
+          test "$(docker image inspect secretary:test --format '{{.Config.User}}')" = '1000:1000'
+          CID=$(docker create secretary:test)
+          docker cp "$CID:/bot" ./bot
+          docker rm -v "$CID"
+          file ./bot | tee binary-info.txt
+          file ./bot | grep 'statically linked'
+          mkdir benchmark-data
+          DATA_DIR="$PWD/benchmark-data" /usr/bin/time -v ./bot selftest 2> memory.txt
+          docker image inspect secretary:test --format '{{.Size}}' > image-bytes.txt
+          wc -c < bot > binary-bytes.txt
+          cat memory.txt image-bytes.txt binary-bytes.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: measurements-${{ matrix.arch }}
+          path: |
+            memory.txt
+            image-bytes.txt
+            binary-bytes.txt
+            binary-info.txt
+      - name: Push verified architecture
+        if: github.event_name != 'pull_request'
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY}:sha-${GITHUB_SHA:0:7}-${{ matrix.arch }}"
+          docker tag secretary:test "$IMAGE"
+          docker push "$IMAGE"
+  manifest:
+    needs: image
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish verified multiarch image
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY}"
+          SHA="sha-${GITHUB_SHA:0:7}"
+          TAGS=(--tag "$IMAGE:$SHA")
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then TAGS+=(--tag "$IMAGE:latest"); fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then TAGS+=(--tag "$IMAGE:${GITHUB_REF#refs/tags/}"); fi
+          docker buildx imagetools create "${TAGS[@]}" "$IMAGE:$SHA-amd64" "$IMAGE:$SHA-arm64"
+          docker buildx imagetools inspect "$IMAGE:$SHA"
