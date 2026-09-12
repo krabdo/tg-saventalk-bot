@@ -39,12 +39,16 @@ func openDB(path string, readOnly bool) *sql.DB {
 }
 func exec(q queryer, s string, args ...any) sql.Result { r, e := q.Exec(s, args...); must(e); return r }
 func rows(q queryer, s string, args ...any) []map[string]any {
+	out := []map[string]any{}
+	eachRow(q, s, func(row map[string]any) { out = append(out, row) }, args...)
+	return out
+}
+func eachRow(q queryer, s string, visit func(map[string]any), args ...any) {
 	r, e := q.Query(s, args...)
 	must(e)
 	defer r.Close()
 	cols, e := r.Columns()
 	must(e)
-	out := []map[string]any{}
 	for r.Next() {
 		vals := make([]any, len(cols))
 		ptrs := make([]any, len(cols))
@@ -59,10 +63,9 @@ func rows(q queryer, s string, args ...any) []map[string]any {
 			}
 			m[k] = vals[i]
 		}
-		out = append(out, m)
+		visit(m)
 	}
 	must(r.Err())
-	return out
 }
 func integer(v any) int64 {
 	if n, ok := v.(int64); ok {
@@ -166,21 +169,21 @@ func (s *Store) migrate(dir, owner string) {
 	old := openDB(path, true)
 	defer old.Close()
 	transaction(s.db, func(q queryer) {
-		for _, r := range rows(old, "SELECT * FROM documents") {
+		eachRow(old, "SELECT * FROM documents", func(r map[string]any) {
 			exec(q, "INSERT OR IGNORE INTO documents VALUES(?,?)", r["key"], r["value"])
-		}
-		for _, r := range rows(old, "SELECT * FROM connections") {
+		})
+		eachRow(old, "SELECT * FROM connections", func(r map[string]any) {
 			exec(q, "INSERT OR IGNORE INTO connections VALUES(?,?,?)", r["id"], r["body"], r["version"])
-		}
-		for _, r := range rows(old, "SELECT * FROM inbox") {
+		})
+		eachRow(old, "SELECT * FROM inbox", func(r map[string]any) {
 			exec(q, "INSERT OR IGNORE INTO inbox VALUES(?,?,?,?,?)", r["id"], r["body"], r["attempts"], r["next_at"], r["done"])
-		}
-		for _, r := range rows(old, "SELECT * FROM command_results") {
+		})
+		eachRow(old, "SELECT * FROM command_results", func(r map[string]any) {
 			exec(q, "INSERT OR IGNORE INTO commands VALUES(?,?)", r["id"], r["result"])
-		}
-		for _, r := range rows(old, "SELECT * FROM topics") {
+		})
+		eachRow(old, "SELECT * FROM topics", func(r map[string]any) {
 			exec(q, "INSERT OR IGNORE INTO topics VALUES(?,?)", r["chat_id"], r["topic"])
-		}
+		})
 		files, e := filepath.Glob(filepath.Join(dir, "chat-"+owner+"_*.sqlite"))
 		must(e)
 		for _, file := range files {
@@ -192,18 +195,18 @@ func (s *Store) migrate(dir, owner string) {
 					return
 				}
 				save(q, v)
-				for _, r := range rows(c, "SELECT * FROM messages") {
+				eachRow(c, "SELECT * FROM messages", func(r map[string]any) {
 					exec(q, "INSERT OR IGNORE INTO messages VALUES(?,?,?,?,?,?,?)", v.Chat, r["key"], r["body"], r["deleted"], r["version"], r["update_id"], r["anchor"])
-				}
-				for _, r := range rows(c, "SELECT * FROM versions") {
+				})
+				eachRow(c, "SELECT * FROM versions", func(r map[string]any) {
 					exec(q, "INSERT OR IGNORE INTO versions VALUES(?,?)", v.Chat, r["key"])
-				}
-				for _, r := range rows(c, "SELECT * FROM archive_jobs") {
+				})
+				eachRow(c, "SELECT * FROM archive_jobs", func(r map[string]any) {
 					exec(q, "INSERT OR IGNORE INTO jobs VALUES(?,?,?,?,?,?,?,?,?)", v.Chat, r["id"], r["source"], r["parts"], r["step"], r["attempts"], r["status"], r["next_at"], r["anchor"])
-				}
-				for _, r := range rows(c, "SELECT * FROM controls") {
+				})
+				eachRow(c, "SELECT * FROM controls", func(r map[string]any) {
 					exec(q, "INSERT OR IGNORE INTO commands VALUES(?,?)", r["id"], r["result"])
-				}
+				})
 			}()
 		}
 		put(q, "nodeImported", true)
