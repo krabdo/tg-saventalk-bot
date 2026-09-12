@@ -1,0 +1,20 @@
+services:
+  bot:
+    image: ghcr.io/krabdo/tg-saventalk-bot:latest
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    volumes:
+      - bot-data:/data
+    stop_grace_period: 70s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+volumes:
+  bot-data:
