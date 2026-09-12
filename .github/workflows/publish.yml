@@ -44,3 +44,19 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Smoke test published container
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY}:sha-${GITHUB_SHA:0:7}"
+          docker run --rm --entrypoint node "$IMAGE" --input-type=module -e '
+            import { Runtime } from "./dist/runtime.js";
+            import "./dist/main.js";
+            const r = new Runtime("/data", {BOT_TOKEN:"1:test",OWNER_ID:"100",AI_BASE_URL:"",AI_MODEL:""});
+            const a = r.env.ACCOUNTS.getByName("100");
+            if (!a.policy().paused || process.getuid() === 0) throw new Error("Invalid container defaults");
+            await a.enqueue({update_id:1});
+            await r.close();
+            console.log("Non-root Linux container and persistent SQLite initialized successfully");
+          '
