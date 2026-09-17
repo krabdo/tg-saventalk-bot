@@ -150,6 +150,7 @@ type Flight struct {
 	Epoch    int64  `json:"epoch"`
 }
 type State struct {
+	ContextSince  int64   `json:"contextSince,omitempty"`
 	Chat          string  `json:"chat"`
 	Name          string  `json:"name"`
 	Paused        bool    `json:"paused"`

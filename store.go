@@ -29,11 +29,13 @@ func openDB(path string, readOnly bool) *sql.DB {
 	} else {
 		q.Set("_journal_mode", "WAL")
 		q.Set("_synchronous", "FULL")
+		q.Set("_secure_delete", "on")
 	}
 	u.RawQuery = q.Encode()
 	db, e := sql.Open("sqlite3", u.String())
 	must(e)
 	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1) // TEMP tables must remain on this one connection.
 	must(db.Ping())
 	return db
 }
@@ -102,22 +104,42 @@ func newStore(dir string) *Store {
 	must(os.MkdirAll(dir, 0700))
 	db := openDB(filepath.Join(dir, "bot.sqlite"), false)
 	s := &Store{db}
+	exec(db, "PRAGMA temp_store=MEMORY; PRAGMA secure_delete=ON")
+	// Delete historical payload tables from older releases before creating
+	// memory-only replacements. No disk table remains as a fallback if the
+	// connection is lost: a missing TEMP table then fails closed.
+	transaction(db, func(q queryer) {
+		for _, table := range []string{"messages", "versions", "jobs", "inbox", "commands"} {
+			if len(rows(q, "SELECT name FROM main.sqlite_master WHERE type='table' AND name=?", table)) > 0 {
+				exec(q, "DELETE FROM main."+table)
+				exec(q, "DROP TABLE main."+table)
+			}
+		}
+	})
 	exec(db, `
  CREATE TABLE IF NOT EXISTS documents(key TEXT PRIMARY KEY,value TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS contacts(chat TEXT PRIMARY KEY,state TEXT NOT NULL);
- CREATE INDEX IF NOT EXISTS contact_pending ON contacts(json_extract(state,'$.pendingAt'));
- CREATE INDEX IF NOT EXISTS contact_retry ON contacts(json_extract(state,'$.retry.At'));
+ CREATE TEMP TABLE contacts(chat TEXT PRIMARY KEY,state TEXT NOT NULL);
+ CREATE INDEX temp.contact_pending ON contacts(json_extract(state,'$.pendingAt'));
+ CREATE INDEX temp.contact_retry ON contacts(json_extract(state,'$.retry.At'));
  CREATE TABLE IF NOT EXISTS connections(id TEXT PRIMARY KEY,body TEXT NOT NULL,version INTEGER NOT NULL);
- CREATE TABLE IF NOT EXISTS inbox(id INTEGER PRIMARY KEY,body TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0,done INTEGER NOT NULL DEFAULT 0);
+ CREATE TEMP TABLE inbox(id INTEGER PRIMARY KEY,body TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0,done INTEGER NOT NULL DEFAULT 0);
  CREATE INDEX IF NOT EXISTS pending_inbox ON inbox(done,next_at,id);
- CREATE TABLE IF NOT EXISTS messages(chat TEXT NOT NULL,key TEXT NOT NULL,body TEXT,deleted INTEGER DEFAULT 0,version INTEGER DEFAULT 0,update_id INTEGER DEFAULT 0,anchor INTEGER,PRIMARY KEY(chat,key));
+ CREATE TEMP TABLE messages(chat TEXT NOT NULL,key TEXT NOT NULL,body TEXT,deleted INTEGER DEFAULT 0,version INTEGER DEFAULT 0,update_id INTEGER DEFAULT 0,anchor INTEGER,PRIMARY KEY(chat,key));
  CREATE INDEX IF NOT EXISTS context_messages ON messages(chat,deleted,json_extract(body,'$.date') DESC,json_extract(body,'$.message_id') DESC) WHERE body IS NOT NULL AND json_extract(body,'$.text') IS NOT NULL;
- CREATE TABLE IF NOT EXISTS versions(chat TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(chat,key));
- CREATE TABLE IF NOT EXISTS jobs(chat TEXT NOT NULL,id INTEGER NOT NULL,source TEXT NOT NULL,parts TEXT NOT NULL,step INTEGER DEFAULT 0,attempts INTEGER DEFAULT 0,status TEXT DEFAULT 'pending',next_at INTEGER DEFAULT 0,anchor INTEGER,PRIMARY KEY(chat,id));
+ CREATE TEMP TABLE versions(chat TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(chat,key));
+ CREATE TEMP TABLE jobs(chat TEXT NOT NULL,id INTEGER NOT NULL,source TEXT NOT NULL,parts TEXT NOT NULL,step INTEGER DEFAULT 0,attempts INTEGER DEFAULT 0,status TEXT DEFAULT 'pending',next_at INTEGER DEFAULT 0,anchor INTEGER,PRIMARY KEY(chat,id));
  CREATE INDEX IF NOT EXISTS pending_jobs ON jobs(status,next_at,chat,id);
- CREATE TABLE IF NOT EXISTS commands(id INTEGER PRIMARY KEY,result TEXT NOT NULL);
+ CREATE TEMP TABLE commands(id INTEGER PRIMARY KEY,result TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS topics(chat TEXT PRIMARY KEY,topic INTEGER UNIQUE NOT NULL);
  `)
+	transaction(db, func(q queryer) {
+		for _, r := range rows(q, "SELECT state FROM main.contacts") {
+			v := decode[State](stringVal(r["state"]))
+			v = minimalState(v)
+			save(q, v)
+		}
+	})
 	return s
 }
 func state(q queryer, chat string) State {
@@ -129,12 +151,27 @@ func state(q queryer, chat string) State {
 	must(e)
 	return decode[State](s)
 }
-func save(q queryer, s State) { exec(q, "INSERT OR REPLACE INTO contacts VALUES(?,?)", s.Chat, raw(s)) }
+func minimalState(s State) State {
+	v := State{Chat: s.Chat, Paused: s.Paused, Limit: s.Limit, Used: s.Used, Topic: s.Topic, TopicState: s.TopicState}
+	if s.Flight != nil && (s.Flight.Phase == "sending" || s.Flight.Phase == "uncertain") {
+		v.Flight = &Flight{Phase: "uncertain"}
+	}
+	return v
+}
+func save(q queryer, s State) {
+	exec(q, "INSERT OR REPLACE INTO temp.contacts VALUES(?,?)", s.Chat, raw(s))
+	exec(q, "INSERT OR REPLACE INTO main.contacts VALUES(?,?)", s.Chat, raw(minimalState(s)))
+}
 func policy(q queryer) Policy {
 	return doc(q, "policy", Policy{Paused: true, Limit: 10, Prompt: defaultPrompt})
 }
 func addJob(q queryer, chat, key string, parts []Part) {
-	exec(q, "INSERT INTO jobs(chat,id,source,parts) SELECT ?,COALESCE(MAX(id),0)+1,?,? FROM jobs WHERE chat=?", chat, key, raw(parts), chat)
+	id := doc(q, "jobSequence", int64(0)) + 1
+	for _, r := range rows(q, "SELECT COALESCE(MAX(id),0)+1 AS next FROM jobs") {
+		id = max(id, integer(r["next"]))
+	}
+	put(q, "jobSequence", id)
+	exec(q, "INSERT INTO jobs(chat,id,source,parts) VALUES(?,?,?,?)", chat, id, key, raw(parts))
 }
 func (s *Store) recover() {
 	transaction(s.db, func(q queryer) {
@@ -178,9 +215,6 @@ func (s *Store) migrate(dir, owner string) {
 		eachRow(old, "SELECT * FROM inbox", func(r map[string]any) {
 			exec(q, "INSERT OR IGNORE INTO inbox VALUES(?,?,?,?,?)", r["id"], r["body"], r["attempts"], r["next_at"], r["done"])
 		})
-		eachRow(old, "SELECT * FROM command_results", func(r map[string]any) {
-			exec(q, "INSERT OR IGNORE INTO commands VALUES(?,?)", r["id"], r["result"])
-		})
 		eachRow(old, "SELECT * FROM topics", func(r map[string]any) {
 			exec(q, "INSERT OR IGNORE INTO topics VALUES(?,?)", r["chat_id"], r["topic"])
 		})
@@ -194,18 +228,9 @@ func (s *Store) migrate(dir, owner string) {
 				if v.Chat == "" {
 					return
 				}
-				save(q, v)
-				eachRow(c, "SELECT * FROM messages", func(r map[string]any) {
-					exec(q, "INSERT OR IGNORE INTO messages VALUES(?,?,?,?,?,?,?)", v.Chat, r["key"], r["body"], r["deleted"], r["version"], r["update_id"], r["anchor"])
-				})
-				eachRow(c, "SELECT * FROM versions", func(r map[string]any) {
-					exec(q, "INSERT OR IGNORE INTO versions VALUES(?,?)", v.Chat, r["key"])
-				})
-				eachRow(c, "SELECT * FROM archive_jobs", func(r map[string]any) {
+				save(q, minimalState(v))
+				eachRow(c, "SELECT * FROM archive_jobs WHERE status!='done'", func(r map[string]any) {
 					exec(q, "INSERT OR IGNORE INTO jobs VALUES(?,?,?,?,?,?,?,?,?)", v.Chat, r["id"], r["source"], r["parts"], r["step"], r["attempts"], r["status"], r["next_at"], r["anchor"])
-				})
-				eachRow(c, "SELECT * FROM controls", func(r map[string]any) {
-					exec(q, "INSERT OR IGNORE INTO commands VALUES(?,?)", r["id"], r["result"])
 				})
 			}()
 		}

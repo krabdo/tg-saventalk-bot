@@ -29,7 +29,7 @@ func (b *Bot) prepare(chat string) *Ticket {
 	messages := []Text{}
 	budget := 24000
 	for _, r := range rows(b.Store.db, "SELECT body FROM messages WHERE chat=? AND deleted=0 AND body IS NOT NULL AND json_extract(body,'$.text') IS NOT NULL ORDER BY json_extract(body,'$.date') DESC,json_extract(body,'$.message_id') DESC LIMIT 20", chat) {
-		m := decode[Message](stringVal(r["body"]))
+		m := decode[ContextText](stringVal(r["body"]))
 		if m.Text == "" {
 			continue
 		}
@@ -41,10 +41,7 @@ func (b *Bot) prepare(chat string) *Ticket {
 			}
 		}
 		budget -= len(text)
-		role := "user"
-		if m.owner(b.Owner) || m.SenderBot != nil {
-			role = "assistant"
-		}
+		role := m.Role
 		messages = append(messages, Text{role, string(utf16.Decode(text))})
 		if budget == 0 {
 			break
@@ -95,11 +92,16 @@ func (b *Bot) launchAI(ctx context.Context) {
 			continue
 		}
 		b.busy[chat] = true
+		if b.aiCancel == nil {
+			b.aiCancel = map[string]context.CancelFunc{}
+		}
+		requestCtx, cancel := context.WithCancel(ctx)
+		b.aiCancel[chat] = cancel
 		b.wg.Add(1)
-		go func(chat string, t Ticket, text string, attempt int) {
+		go func(ctx context.Context, chat string, t Ticket, text string, attempt int) {
 			defer safePanic()
 			defer b.wg.Done()
-			defer func() { b.mu.Lock(); delete(b.busy, chat); b.mu.Unlock() }()
+			defer func() { cancel(); b.mu.Lock(); delete(b.busy, chat); delete(b.aiCancel, chat); b.mu.Unlock() }()
 			if text == "" {
 				var e error
 				text, e = b.API.complete(ctx, t.Messages)
@@ -118,7 +120,7 @@ func (b *Bot) launchAI(ctx context.Context) {
 				}
 			}
 			b.finishAI(ctx, chat, t, text, attempt)
-		}(chat, *t, text, attempt)
+		}(requestCtx, chat, *t, text, attempt)
 		if len(b.busy) >= 4 {
 			return
 		}
@@ -180,7 +182,11 @@ func (b *Bot) finishAI(ctx context.Context, chat string, t Ticket, text string, 
 			if sent.From == nil {
 				sent.From = &User{ID: b.Owner, First: "我"}
 			}
-			b.record(q, &s, sent, 0, false, policy(q))
+			p := policy(q)
+			if s.Revision != t.Revision || p.Version != t.PolicyVersion {
+				p.Paused = true
+			}
+			b.record(q, &s, sent, 0, false, p)
 			if s.Flight != nil && s.Flight.Token == t.Token {
 				s.Flight = nil
 			}
@@ -195,7 +201,7 @@ func (b *Bot) finishAI(ctx context.Context, chat string, t Ticket, text string, 
 			if s.Flight.Epoch == s.Epoch {
 				s.Used = max(0, s.Used-1)
 			}
-			if a.Code == 429 && attempt < 4 {
+			if a.Code == 429 && attempt < 4 && s.Revision == t.Revision && policy(q).Version == t.PolicyVersion && contextEnabled(s, policy(q)) {
 				s.Flight.Phase = "generating"
 				s.Retry = &Retry{Ticket: t, Text: text, Attempts: attempt + 1, At: now() + int64(max(1, a.Retry))*1000}
 				s.AIError = "Telegram 限流，等待重试"

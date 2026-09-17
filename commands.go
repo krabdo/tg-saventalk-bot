@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const help = "通过 BotFather 开启 Secretary Mode 和私聊话题，在 Telegram 聊天自动化连接本 Bot。归档在你与 Bot 私聊的联系人话题中。\n/status all|用户ID\n/pause all|用户ID\n/resume all|用户ID\n/limit N all|用户ID\n/reset 用户ID\n/prompt 文本（也可回复文字执行）\n/prompt_show /prompt_reset\n/retry（联系人话题内）\n话题内可省略目标，其他位置必须指定。初始 AI 暂停，默认每人累计 10 条；原私聊人工回复自动暂停该联系人。话题备注不会代发。"
@@ -23,7 +24,7 @@ func (b *Bot) command(q queryer, id int64, m Message) string {
 		return ""
 	}
 	answer := b.execute(q, match[1], strings.TrimSpace(match[3]), m)
-	exec(q, "INSERT INTO commands VALUES(?,?)", id, answer)
+	exec(q, "INSERT INTO commands VALUES(?,?)", id, "")
 	return answer
 }
 func (b *Bot) execute(q queryer, cmd, args string, m Message) string {
@@ -107,7 +108,7 @@ func (b *Bot) execute(q queryer, cmd, args string, m Message) string {
 			if p.Connection != nil && p.Connection.Enabled {
 				connection = "已启用"
 			}
-			return fmt.Sprintf("连接：%s\n全局暂停：%t\n默认额度：%d\nAI 配置：%t\n联系人：%s", connection, p.Paused, p.Limit, b.API.configured(), strings.Join(ids, ", "))
+			return fmt.Sprintf("连接：%s\n全局暂停：%t\n默认额度：%d\nAI 配置：%t\n消息与上下文：仅内存\n每日零点清理：%t\n服务器时间：%s\n联系人：%s", connection, p.Paused, p.Limit, b.API.configured(), b.CleanupMidnight, time.Now().Format("2006-01-02 15:04:05 MST -0700"), strings.Join(ids, ", "))
 		case "pause":
 			p.Paused = true
 		case "resume":
@@ -122,6 +123,17 @@ func (b *Bot) execute(q queryer, cmd, args string, m Message) string {
 		}
 		p.Version++
 		put(q, "policy", p)
+		if p.Paused {
+			b.clearAll(q, time.Now().Unix())
+		} else if cmd == "limit" {
+			for _, r := range rows(q, "SELECT state FROM contacts") {
+				s := decode[State](stringVal(r["state"]))
+				if !contextEnabled(s, p) {
+					b.clearContact(q, &s, time.Now().Unix())
+					save(q, s)
+				}
+			}
+		}
 		return "全局设置已更新；联系人暂停与计数保持。"
 	}
 	if !isDigits(target) {
@@ -182,6 +194,9 @@ func (b *Bot) execute(q queryer, cmd, args string, m Message) string {
 		return help
 	}
 	s.Revision++
+	if !contextEnabled(s, p) {
+		b.clearContact(q, &s, time.Now().Unix())
+	}
 	save(q, s)
 	return "联系人设置已更新。恢复不清零，清零不解除暂停；新文字可触发 AI。"
 }

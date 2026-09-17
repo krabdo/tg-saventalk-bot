@@ -14,7 +14,12 @@ func advance(q queryer, j Job, message int64) {
 	if j.Step+1 >= len(j.Parts) {
 		status = "done"
 	}
-	exec(q, "UPDATE jobs SET status=?,step=step+1,attempts=0,anchor=COALESCE(anchor,?) WHERE chat=? AND id=?", status, message, j.Chat, j.ID)
+	if status == "done" {
+		exec(q, "DELETE FROM jobs WHERE chat=? AND id=?", j.Chat, j.ID)
+	} else {
+		j.Parts[j.Step] = Part{} // Release the already forwarded portion immediately.
+		exec(q, "UPDATE jobs SET parts=?,status=?,step=step+1,attempts=0,anchor=COALESCE(anchor,?) WHERE chat=? AND id=?", raw(j.Parts), status, message, j.Chat, j.ID)
+	}
 	if j.Step == 0 {
 		exec(q, "UPDATE messages SET anchor=COALESCE(anchor,?) WHERE chat=? AND key=?", message, j.Chat, j.Source)
 	}
@@ -57,6 +62,7 @@ func (b *Bot) ensureTopic(ctx context.Context, chat string) (int64, error) {
 	}
 	s.Topic = result.Thread
 	s.TopicState = ""
+	s.Name = ""
 	transaction(b.Store.db, func(q queryer) { save(q, s); exec(q, "INSERT OR REPLACE INTO topics VALUES(?,?)", chat, s.Topic) })
 	return s.Topic, nil
 }
@@ -124,7 +130,7 @@ func (b *Bot) archiveStep(ctx context.Context) {
 			notice := Part{Method: "sendMessage", Body: Obj{"text": "⚠️ 原话题已删除，以下内容继续保存到新话题；旧副本无法恢复。"}}
 			j.Parts = append(j.Parts[:j.Step], append([]Part{notice}, j.Parts[j.Step:]...)...)
 		} else if !a.Uncertain && a.Code == 400 && part.Media {
-			j.Parts[j.Step] = Part{Method: "sendMessage", Body: Obj{"text": clip(fmt.Sprintf("⚠️ 媒体未备份：Telegram 拒绝重发。源 %s，类型 %s，元数据保留。\n说明：%v", j.Source, part.Method, part.Body["caption"]), 4000)}}
+			j.Parts[j.Step] = Part{Method: "sendMessage", Body: Obj{"text": clip(fmt.Sprintf("⚠️ 媒体未备份：Telegram 拒绝重发。源 %s，类型 %s。\n说明：%v", j.Source, part.Method, part.Body["caption"]), 4000)}}
 			status = "pending"
 		}
 		exec(q, "UPDATE jobs SET parts=?,status=?,attempts=attempts+1,next_at=? WHERE chat=? AND id=?", raw(j.Parts), status, now()+delay, j.Chat, j.ID)

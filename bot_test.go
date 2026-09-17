@@ -173,7 +173,8 @@ func TestArchiveVersionsDeletionAndDuplicate(t *testing.T) {
 	f.ingest(m)
 	check(t, len(rows(f.b.Store.db, "SELECT * FROM jobs")) == 4)
 	r := rows(f.b.Store.db, "SELECT * FROM messages WHERE key='conn:1'")[0]
-	check(t, integer(r["deleted"]) == 1 && strings.Contains(stringVal(r["body"]), "新版本"))
+	check(t, integer(r["deleted"]) == 1 && r["body"] == nil)
+	check(t, strings.Contains(raw(rows(f.b.Store.db, "SELECT parts FROM jobs")), "新版本"))
 	check(t, strings.Contains(stringVal(rows(f.b.Store.db, "SELECT parts FROM jobs WHERE id=4")[0]["parts"]), "未收到原消息"))
 }
 func TestDeleteBeforeMessageExcludedFromAI(t *testing.T) {
@@ -239,7 +240,7 @@ func TestArchiveSendAndTopicOnce(t *testing.T) {
 		}
 	}
 	check(t, n == 1)
-	check(t, len(rows(f.b.Store.db, "SELECT * FROM jobs WHERE status='done'")) == 2)
+	check(t, len(rows(f.b.Store.db, "SELECT * FROM jobs")) == 0)
 }
 func TestArchiveFailures(t *testing.T) {
 	for _, scenario := range []string{"429", "403", "uncertain", "closed", "deleted", "media"} {
@@ -310,8 +311,12 @@ func TestAIQuotaAndEcho(t *testing.T) {
 	f.b.finishAI(context.Background(), "200", *ticket, "答复", 0)
 	s = state(f.b.Store.db, "200")
 	check(t, s.Used == 1 && s.Flight == nil && !s.Paused)
-	r := rows(f.b.Store.db, "SELECT body FROM messages WHERE json_extract(body,'$.sender_business_bot') IS NOT NULL")
-	m := decode[Message](stringVal(r[0]["body"]))
+	r := rows(f.b.Store.db, "SELECT body FROM messages WHERE json_extract(body,'$.role')='assistant'")
+	v := decode[ContextText](stringVal(r[0]["body"]))
+	m := message(v.ID)
+	m.Text = v.Text
+	m.From = &User{ID: 100}
+	m.SenderBot = &User{Bot: true}
 	before := len(rows(f.b.Store.db, "SELECT * FROM jobs"))
 	f.ingest(m)
 	check(t, len(rows(f.b.Store.db, "SELECT * FROM jobs")) == before)
@@ -460,7 +465,7 @@ func TestRestartRecoveryAndTransactions(t *testing.T) {
 	f.b.Store.recover()
 	s = state(f.b.Store.db, "200")
 	check(t, s.Flight.Phase == "uncertain" && s.Used == 1 && s.TopicState == "uncertain")
-	check(t, stringVal(rows(f.b.Store.db, "SELECT status FROM jobs")[0]["status"]) == "uncertain")
+	check(t, len(rows(f.b.Store.db, "SELECT * FROM jobs")) == 0)
 	func() {
 		defer func() { _ = recover() }()
 		transaction(f.b.Store.db, func(q queryer) { put(q, "bad", true); panic("crash") })
@@ -517,7 +522,7 @@ func TestNodeMigration(t *testing.T) {
 	defer s.db.Close()
 	s.migrate(dir, "100")
 	check(t, policy(s.db).Limit == 7 && state(s.db, "200").Used == 4 && doc(s.db, "offset", int64(0)) == 123)
-	check(t, len(rows(s.db, "SELECT * FROM messages")) == 1 && len(rows(s.db, "SELECT * FROM jobs")) == 1)
+	check(t, len(rows(s.db, "SELECT * FROM messages")) == 0 && len(rows(s.db, "SELECT * FROM jobs")) == 1)
 	s.migrate(dir, "100")
 	check(t, len(rows(s.db, "SELECT * FROM jobs")) == 1)
 }

@@ -74,6 +74,15 @@ func run() error {
 	store.migrate(dir, str(owner))
 	store.recover()
 	bot := &Bot{Store: store, Owner: owner, Dir: dir, API: newAPI(os.Getenv("BOT_TOKEN"), os.Getenv("AI_BASE_URL"), os.Getenv("AI_MODEL"), os.Getenv("AI_API_KEY"))}
+	if value := os.Getenv("CLEANUP_AT_MIDNIGHT"); value != "" {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("CLEANUP_AT_MIDNIGHT must be true or false")
+		}
+		bot.CleanupMidnight = enabled
+	}
+	bot.privacyStartup()
+	eraseLegacy(dir, str(owner))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if e = bot.setup(ctx); e != nil {
